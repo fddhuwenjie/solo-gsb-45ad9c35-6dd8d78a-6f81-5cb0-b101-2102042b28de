@@ -9,17 +9,28 @@
   mutex       同一物理连通分量上出现互斥的规范信号名；
   alias-ring  别名指向成环（含同一别名被指向多个不同规范名的分叉声明）；
   unlabeled   承载路由信号的跳线 / 半常态分流点没有任何标签（无标签断点）；
-  crosstalk   携带不同规范信号名的两条路由在同一连通分量汇合（跨路由串线）。
+  crosstalk   追溯到**独立信号源**（无上游驱动的设备输出端口）的两条已规划路由
+              汇入同一物理连通分量（跨路由串线）。
+
+串线判定与标签名称**完全解耦**：把物理边按真实信号流向定向（设备内部 输入→输出、
+生效常态 上→下、跳线 输出插孔→输入插孔），沿反向边追溯每条已规划路由源端口的
+全部“信号源端口”；只要同一物理连通分量里出现两个不同的信号源，就发生串线——
+设备内部多入单出混合、半常态上插孔插线并送都会如实追溯，而同一信号源经半常态
+并送出的平行支路不会误报。改名（规范名 / 别名）既不会制造串线也不能消除串线：
+crosstalk 问题不提供 rename 类修正，只有路由规划或物理连通（常态模式 / 跳线）
+改变、两条独立信号源不再汇入同一分量时才消失。
 
 每个问题都给出：
 
-  - 两个命名端点之间的**最短证据路径**（多源 BFS，沿无向物理图）；
-  - 可采纳的规范名（分量内声明次数最多、并列时取字典序最小者）；
-  - 一组**修正预览**（把落败名降级为别名的 rename / 补标签的 add-label），
-    仅供前端预览与回填，审计本身不修改路由，也不回写任何配置。
+  - 两个命名/信号源端点之间的**最短证据路径**（多源 BFS，沿无向物理图）；
+  - 可采纳的规范名（分量内声明次数最多、并列时取字典序最小者；串线问题无此建议）；
+  - 一组**修正预览**（把落败名降级为别名的 rename / 补标签的 add-label /
+    剪断别名环的 break-alias），仅供前端预览与回填，审计本身不修改路由，
+    也不回写任何配置；跨路由串线没有可消警的改名类修正。
 """
 
 from collections import defaultdict, deque
+from itertools import combinations
 
 from solver import MODE_LABELS, THROUGH, ConfigError, plan_all
 
@@ -372,6 +383,58 @@ def build_physical_graph(plan):
     return adj
 
 
+def signal_origins(plan, adj):
+    """沿真实信号流向追溯每个端口的全部独立信号源。
+
+    信号源＝没有任何上游驱动的设备**输出**端口（如话放/合成器输出）。物理边按
+    流向定向：设备内部 输入→输出、生效常态 上→下、跳线 输出插孔→输入插孔。
+    端口 p 的 origins[p] 为按流向可达 p 的全部信号源端口；多输入设备的每个输出
+    都汇聚其全部输入的信号源（设备内部混合），半常态上插孔插线并送时常态方向
+    （上→下）与跳线方向（从上插孔出）并存，两套来源都会追溯到。
+
+    返回 (origins, preds)：origins 为 {端口: {信号源端口}}，preds 为有向前驱。
+    用不动点迭代求最小不动点（端口规模小），天然处理反馈环：纯环路（无任何
+    信号源）中的端口得到空集，由调用方决定是否退化为“以自身为源”。
+    """
+    solver = plan["solver"]
+    ports = list(solver.port_dir)
+
+    # 有向前驱：preds[v] = 信号流向 v 的全部上游端口
+    preds = defaultdict(set)
+    for name, d in plan["devices"].items():
+        for i in d["inputs"]:
+            for o in d["outputs"]:
+                preds[f"{name}.{o}"].add(f"{name}.{i}")
+    for p in plan["pairs"]:
+        if solver.normal_active(p) and p["top"] and p["bottom"]:
+            preds[f"{p['bottom']['device']}.{p['bottom']['port']}"].add(
+                f"{p['top']['device']}.{p['top']['port']}")
+    for c in solver.cables:
+        preds[c["toPort"]].add(c["fromPort"])
+
+    def is_out(p):
+        return solver.port_dir.get(p, (None, None))[1] == "out"
+
+    # 种子：无上游驱动的输出端口自身即独立信号源
+    origins = {p: ({p} if is_out(p) and not preds.get(p) else set())
+               for p in ports}
+    while True:
+        changed = False
+        for p in ports:
+            upstream = preds.get(p)
+            if not upstream:
+                continue
+            merged = set()
+            for u in upstream:
+                merged |= origins[u]
+            if not merged <= origins[p]:
+                origins[p] |= merged
+                changed = True
+        if not changed:
+            break
+    return origins, preds
+
+
 def _union_find(nodes):
     parent = {n: n for n in nodes}
 
@@ -397,9 +460,10 @@ def shortest_path(adj, starts, goals):
     starts, goals = set(starts), set(goals)
     common = starts & goals
     if common:
-        return [next(iter(common))], {}
+        return [min(common)], {}
     prev = {s: (None, None) for s in starts}
-    q = deque(starts)
+    q = deque(sorted(starts))                     # 排序：BFS 前驱只依赖物理拓扑，
+                                                  # 改名/别名变化后证据路径不变
     hit = None
     while q and hit is None:
         u = q.popleft()
@@ -483,9 +547,8 @@ def audit_signals(config, labels_raw):
                 routed_ports.add(payload)
     active_component = {find(p) for p in routed_ports}
 
-    # ---- 名签按端口聚合（区分静态标签与路由流动断言） --------------------
+    # ---- 名签按端口聚合（路由名签不参与任何物理判定，串线与名称解耦） ------
     static_at = defaultdict(list)          # node -> [{canonical, raw, origin}]
-    route_at = defaultdict(list)
     static_labeled = set()                 # 任何静态名签（含纯别名）所在端口
     labeled_nodes = set()
     for d in decls:
@@ -493,9 +556,8 @@ def audit_signals(config, labels_raw):
         if d["origin"][0] != "route":
             if d["name"] or d["alias"]:
                 static_labeled.add(d["node"])
-        if d["name"]:
-            bucket = route_at if d["origin"][0] == "route" else static_at
-            bucket[d["node"]].append({
+        if d["name"] and d["origin"][0] != "route":
+            static_at[d["node"]].append({
                 "canonical": resolver.resolve(d["name"]),
                 "raw": d["name"], "origin": d["origin"],
                 "originAlias": d["originAlias"],
@@ -652,83 +714,120 @@ def audit_signals(config, labels_raw):
             }],
         })
 
-    # ---- 4) 跨路由串线：不同信号名的路由源汇于同一物理分量 --------------
-    def route_signal(idx, r):
-        """路由携带的代表规范名：路由名签优先，否则取源端口唯一静态名。"""
-        for d in route_at.get(f"{r['source']['device']}.{r['source']['port']}", ()):
-            return d["canonical"], d["origin"]
-        src = f"{r['source']['device']}.{r['source']['port']}"
-        stat = {nd["canonical"] for nd in static_at.get(src, ())}
-        if len(stat) == 1:
-            return next(iter(stat)), None
-        return None, None
+    # ---- 4) 跨路由串线：追溯独立信号源，与标签名称完全解耦 --------------
+    # 沿真实信号流向追溯每个端口的独立信号源（无上游驱动的设备输出端口）。
+    origins, direct_preds = signal_origins(plan, adj)
 
-    route_sigs = []
+    # 每条已规划路由按其源端口归属信号源；纯反馈环（路由源经上游追溯不到任何
+    # 无驱动输出，且自身物理上被环内上游驱动）中的路由不归属任何独立信号源，
+    # 因此不参与串线判定——环内没有“两个独立信号源”可串。
+    route_origins = {}
     for idx, r in enumerate(plan["routes"]):
         if not plan["planned"][idx]["ok"]:
             continue
-        canon, origin = route_signal(idx, r)
-        if canon:
-            src = f"{r['source']['device']}.{r['source']['port']}"
-            route_sigs.append((idx, canon, src, origin))
-    by_comp = defaultdict(list)
-    for idx, canon, src, origin in route_sigs:
-        by_comp[find(src)].append((idx, canon, src, origin))
-    for root, group in by_comp.items():
-        name_routes = defaultdict(list)         # canonical -> [(idx, src, origin)]
-        for idx, canon, src, origin in group:
-            name_routes[canon].append((idx, src, origin))
-        present = sorted(name_routes)
-        votes = {n: sum(1 for _ in entries)
-                 for n, entries in components[root]["names"].items() if entries}
-        for ai in range(len(present)):
-            for bi in range(ai + 1, len(present)):
-                ca, cb = present[ai], present[bi]
-                a_entries, b_entries = name_routes[ca], name_routes[cb]
-                nodes, _ = shortest_path(
-                    adj, [s for _, s, _ in a_entries], [s for _, s, _ in b_entries])
-                if nodes is None:
-                    continue
-                preferred = min((ca, cb), key=lambda n: (-votes.get(n, 0), n))
-                loser = cb if preferred == ca else ca
-                r_a = [i for i, _, _ in a_entries]
-                r_b = [i for i, _, _ in b_entries]
-                fixes = _rename_fixes(components[root]["names"], preferred,
-                                      {loser}, rows)
-                seen_fix = {(f["target"]["kind"], f["target"].get("id"),
-                             f["target"].get("port"), f["target"].get("index"))
-                            for f in fixes}
-                # 落败信号名对应路由上的路由名签也要改（去重）
-                loser_routes = r_b if loser == cb else r_a
-                for ridx in loser_routes:
-                    origin = ("route", ridx)
-                    key = ("route", None, None, ridx)
-                    if key in seen_fix:
-                        continue
-                    raw = rows.get(origin, {}).get("name")
-                    if raw and resolver.resolve(raw) != preferred:
-                        fixes.append(_rename_fix(origin, raw, preferred, rows))
-                        seen_fix.add(key)
-                desc = lambda name, entries: (
-                    f"“{name}”（路由 {'、'.join(str(i + 1) for i, _, _ in entries)}，"
-                    f"源 {entries[0][1]}）")
-                issues.append({
-                    "type": CROSSTALK, "severity": "error",
-                    "title": TYPE_TITLES[CROSSTALK],
-                    "message": f"携带 {desc(ca, a_entries)} 与 {desc(cb, b_entries)} "
-                               f"的路由在同一连通分量物理汇合，两条不同名信号发生"
-                               f"跨路由串线；若确认为同一信号，请统一规范名，否则应"
-                               f"断开它们之间的连通（审计不会自动改线）。",
-                    "component": root, "names": sorted((ca, cb)),
-                    "conflictingNames": [loser],
-                    "preferredName": preferred,
-                    "routes": sorted(r_a + r_b),
-                    "routesByName": {ca: r_a, cb: r_b},
-                    "suggestedName": preferred,
-                    "evidence": evidence_items(nodes, adj, plan,
-                                               _node_label_map(decls)),
-                    "fixes": fixes,
-                })
+        src = f"{r['source']['device']}.{r['source']['port']}"
+        ogs = set(origins.get(src) or ())
+        if not ogs and not direct_preds.get(src):
+            ogs = {src}                    # 无上游驱动的输出端口自身即独立信号源
+        if ogs:
+            route_origins[idx] = ogs
+
+    # 物理分量 → 该分量内被已规划路由携带的信号源集合
+    sources_by_comp = defaultdict(set)
+    for idx, ogs in route_origins.items():
+        sources_by_comp[find(plan["planned"][idx]["source"])].update(ogs)
+
+    crosstalk_pairs = []
+    for root, srcs in sources_by_comp.items():
+        if len(srcs) < 2:
+            continue
+        for a, b in combinations(sorted(srcs), 2):
+            crosstalk_pairs.append((root, a, b))
+
+    for root, og_a, og_b in sorted(crosstalk_pairs,
+                                   key=lambda x: (x[1], x[2])):
+        # 证据：只携带一侧信号源的端口（混合点之前的独立支路）之间的最短
+        # 无向路径；路径上的“单侧 ↔ 双侧”跳即汇合边（设备内部 / 常态 / 跳线）。
+        side_a, side_b = [], []
+        for p in components[root]["ports"]:
+            ogs = origins.get(p)
+            if ogs is None:
+                continue
+            has_a, has_b = og_a in ogs, og_b in ogs
+            if has_a and not has_b:
+                side_a.append(p)
+            elif has_b and not has_a:
+                side_b.append(p)
+        # 追溯不到源的纯环路退化情形：源端口自身 origins 为空集，手动补为支路端
+        side_a = sorted(set(side_a) | ({og_a} if not origins.get(og_a) else set()))
+        side_b = sorted(set(side_b) | ({og_b} if not origins.get(og_b) else set()))
+        side_a = [p for p in side_a if find(p) == root]
+        side_b = [p for p in side_b if find(p) == root]
+        nodes, _ = shortest_path(adj, side_a, side_b)
+        if nodes is None:
+            continue
+
+        # 汇合边：路径上“一侧端口 ↔ 已含两侧信号的混合端口”的那一跳
+        merge_edge = None
+        for i in range(len(nodes) - 1):
+            x, y = nodes[i], nodes[i + 1]
+            ox, oy = origins.get(x), origins.get(y)
+            x_mix = bool(ox) and og_a in ox and og_b in ox
+            y_mix = bool(oy) and og_a in oy and og_b in oy
+            if x_mix != y_mix:
+                merge_edge = edge_between(adj, x, y)
+                break
+
+        routes_a = sorted(i for i, ogs in route_origins.items()
+                          if og_a in ogs and find(plan["planned"][i]["source"]) == root)
+        routes_b = sorted(i for i, ogs in route_origins.items()
+                          if og_b in ogs and find(plan["planned"][i]["source"]) == root)
+        routes_ab = sorted(set(routes_a) & set(routes_b))
+
+        where = "在设备内部混合"
+        if merge_edge and merge_edge.get("type") == "normal":
+            where = f"经第 {merge_edge['pairId']} 对生效常态汇合"
+        elif merge_edge and merge_edge.get("type") == "cable":
+            where = f"经跳线 #{merge_edge['cableId']} 汇合"
+
+        def src_desc(og, ridxs):
+            pure = [i for i in ridxs if i not in routes_ab]
+            return (f"独立信号源 {og}（由路由 "
+                    f"{'、'.join(str(i + 1) for i in pure) or '—'} 携带）")
+
+        msg_parts = [
+            f"{src_desc(og_a, routes_a)} 与 {src_desc(og_b, routes_b)} "
+            f"{where}，两条来源独立的信号在同一物理连通分量汇合，发生跨路由串线。",
+        ]
+        if routes_ab:
+            msg_parts.append(
+                f"路由 {'、'.join(str(i + 1) for i in routes_ab)} 本身就建立在"
+                f"两源混合后的通路上。")
+        msg_parts.append(
+            "串线是物理汇合：修改规范名或别名不能消除（本问题不提供改名修正），"
+            "只有调整路由规划或断开它们之间的物理连通（改常态模式 / 移除跳线），"
+            "使两源不再汇入同一连通分量，复审才会消除；复审仍沿同一物理证据路径高亮。")
+        issues.append({
+            "type": CROSSTALK, "severity": "error",
+            "title": TYPE_TITLES[CROSSTALK],
+            "message": "".join(msg_parts),
+            "component": root,
+            "names": sorted((og_a, og_b)),
+            "sources": [og_a, og_b],
+            "routes": sorted(set(routes_a) | set(routes_b)),
+            "routesBySource": {og_a: routes_a, og_b: routes_b},
+            "mixedRoutes": routes_ab,
+            "mergeEdge": merge_edge,
+            "fixableByLabel": False,
+            "suggestedName": None,
+            "evidence": evidence_items(nodes, adj, plan, _node_label_map(decls)),
+            "fixes": [],
+            "resolution": {
+                "labelChanges": False,
+                "requires": "改变路由规划或物理连通（常态模式 / 跳线），使两条独立"
+                             "信号源不再汇入同一连通分量",
+            },
+        })
 
     # ---- 排序与编号 ------------------------------------------------------
     order = {MUTEX: 0, CROSSTALK: 1, ALIAS_RING: 2, UNLABELED: 3}

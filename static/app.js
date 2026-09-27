@@ -953,18 +953,28 @@ function renderAuditResult(data) {
 
 function issueCardHtml(iss) {
   const evPorts = iss.evidence.filter((x) => x.kind === "port").map((x) => x.port);
-  const fixes = (iss.fixes || []).map((fx, i) => {
-    let change = "";
-    if (fx.action === "rename") {
-      change = `<span class="fix-from">${esc(fx.fromName)}</span> → 规范名 <span class="fix-to">${esc(fx.toName)}</span>，原名保留为别名`;
-    } else if (fx.action === "add-label") {
-      change = `补填规范名 <span class="fix-to">${esc(fx.name || "（需人工指定）")}</span>`;
-    } else if (fx.action === "break-alias") {
-      change = `删除别名 <span class="fix-from">${esc(fx.removedAlias)}</span> 以剪断环边，规范名统一为 <span class="fix-to">${esc(fx.name)}</span>`;
-    }
-    return `<li>${esc(fx.targetLabel)}：${change}
-      <button onclick="applyAuditFix(${iss.id}, ${i}); event.stopPropagation()">采纳</button></li>`;
-  }).join("");
+  let fixesHtml = "";
+  if (iss.type === "crosstalk") {
+    // 串线是物理汇合：改名不能消警，不提供任何 rename / add-label 操作
+    fixesHtml = `<ul class="fix-list"><li class="fix-readonly">
+      ⚠️ 串线由独立信号源物理汇合造成，<b>改名或加别名不能消除</b>；请调整路由规划，
+      或断开它们之间的物理连通（改常态模式 / 移除跳线），使两源不再汇入同一连通分量。
+      复审时仍高亮下方同一条物理证据路径。</li></ul>`;
+  } else {
+    const fixes = (iss.fixes || []).map((fx, i) => {
+      let change = "";
+      if (fx.action === "rename") {
+        change = `<span class="fix-from">${esc(fx.fromName)}</span> → 规范名 <span class="fix-to">${esc(fx.toName)}</span>，原名保留为别名`;
+      } else if (fx.action === "add-label") {
+        change = `补填规范名 <span class="fix-to">${esc(fx.name || "（需人工指定）")}</span>`;
+      } else if (fx.action === "break-alias") {
+        change = `删除别名 <span class="fix-from">${esc(fx.removedAlias)}</span> 以剪断环边，规范名统一为 <span class="fix-to">${esc(fx.name)}</span>`;
+      }
+      return `<li>${esc(fx.targetLabel)}：${change}
+        <button onclick="applyAuditFix(${iss.id}, ${i}); event.stopPropagation()">采纳</button></li>`;
+    }).join("");
+    fixesHtml = fixes ? `<ul class="fix-list">${fixes}</ul>` : "";
+  }
   const tagLabel = iss.subtype === "cycle" ? "别名环"
     : iss.subtype === "diverging" ? "别名分叉" : ISSUE_TYPE_LABEL[iss.type];
   return `<div class="issue-card severity-${iss.severity}" id="issue-card-${iss.id}"
@@ -976,7 +986,7 @@ function issueCardHtml(iss) {
       ${iss.component != null ? `<span class="hint">连通分量 #${iss.component + 1}</span>` : ""}
     </div>
     <div class="issue-msg">${esc(iss.message)}</div>
-    ${fixes ? `<ul class="fix-list">${fixes}</ul>` : ""}
+    ${fixesHtml}
     <span class="issue-evidence-toggle">▸ 最短证据路径（${evPorts.length} 个端点）</span>
     <div class="evidence-box" hidden>${chainHtml(iss.evidence)}</div>
   </div>`;
