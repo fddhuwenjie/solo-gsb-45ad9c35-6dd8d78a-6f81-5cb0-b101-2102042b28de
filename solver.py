@@ -831,7 +831,8 @@ EXAMPLES = {
                 {"id": 1, "top": "MIC.out", "bottom": "PRE.in", "mode": "half"},
                 {"id": 2, "top": "PRE.out", "bottom": "COMP.in", "mode": "half"},
                 {"id": 3, "top": "COMP.out", "bottom": "MIX.in1", "mode": "half"},
-                # 第4对直通：AUX 信号跨线跳进 MIX.in2 → 与 VOX 在 MIX 内部串线
+                # 第4对直通：AUX 信号跨线跳进 MIX.in2 → 与 MIC 信号在 MIX 内部汇合
+                # （两个独立信号源并入同一物理分量 → 跨路由串线，改名不能消除）
                 {"id": 4, "top": "AUX.out", "bottom": "MIX.in2", "mode": "through"},
                 {"id": 5, "top": "MIX.out", "bottom": "MON.in", "mode": "half"},
                 # 第6对直通：MIC.out 经 1T 跳线并送到 SEND（半常态上插孔插线）
@@ -850,7 +851,8 @@ EXAMPLES = {
                     # MIC/PRE 链叫 VOX；两个别名声明首尾相接成环（VOX→LEAD→VOX）
                     {"port": "MIC.out", "name": "VOX", "alias": "LEAD"},
                     {"port": "PRE.out", "name": "LEAD", "alias": "VOX"},
-                    # AUX 信号与它在 MIX 处汇合的输出叫法不一致 → 互斥 + 串线
+                    # AUX 与 MIX 输出叫法不一致 → 互斥名；与 MIC 的串线由两个
+                    # 独立信号源在同一分量汇合决定（不依赖这里的名字，改名也不消警）
                     {"port": "AUX.out", "name": "AUX-MIX"},
                     {"port": "MIX.out", "name": "MIX-OUT"},
                 ],

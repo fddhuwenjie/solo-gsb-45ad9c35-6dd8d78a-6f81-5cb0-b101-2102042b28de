@@ -9,14 +9,23 @@
   mutex       同一物理连通分量上出现互斥的规范信号名；
   alias-ring  别名指向成环（含同一别名被指向多个不同规范名的分叉声明）；
   unlabeled   承载路由信号的跳线 / 半常态分流点没有任何标签（无标签断点）；
-  crosstalk   携带不同规范信号名的两条路由在同一连通分量汇合（跨路由串线）。
+  crosstalk   来自**独立信号源**的已规划路由在同一连通分量汇合（跨路由串线）。
 
 每个问题都给出：
 
-  - 两个命名端点之间的**最短证据路径**（多源 BFS，沿无向物理图）；
+  - 两个命名端点（串线为两组独立源端口）之间的**最短证据路径**
+    （多源 BFS，沿无向物理图）；
   - 可采纳的规范名（分量内声明次数最多、并列时取字典序最小者）；
   - 一组**修正预览**（把落败名降级为别名的 rename / 补标签的 add-label），
     仅供前端预览与回填，审计本身不修改路由，也不回写任何配置。
+
+跨路由串线**与名签完全解耦**：判定只依据路由规划与物理连通——
+每条已规划路由的信号源即其源端口；同一源端口的路由天然同源；源端口在
+有向信号流图（设备内部 in→out、生效常态 上→下、跳线 from→to）上同属一个
+强连通分量的合并为一个独立源；能被其他源沿信号方向到达的源（如调音台
+混合输出）不是独立源，其路由按上游独立源归属。同一无向物理分量内出现
+两个互不衍生的独立源即报串线（覆盖设备内部混合与半常态并送汇合），
+**不提供可消警的改名操作**，只有调整路由规划或物理连通才能消除。
 """
 
 from collections import defaultdict, deque
@@ -71,8 +80,9 @@ def parse_labels(raw, plan):
 
     decls:  [{node, name(原始), alias(原始), origin(key 元组), originAlias}]
     rows:   {origin key: {"name":..., "alias":...}}（同一 origin 只允许一行）
-    一条 pair/cable/route 行的名签会同时挂到其两端端口；route 行还代表
-    “该路由携带此信号”的流动断言（不参与静态互斥归并）。
+    一条 pair/cable/route 行的名签会同时挂到其两端端口；route 行的名签
+    只参与别名图解析与规范名计数（不参与静态互斥归并，也不再作为
+    跨路由串线的判定依据——串线只追溯独立信号源与路由归属）。
     """
     if raw is None:
         raw = {}
@@ -372,6 +382,30 @@ def build_physical_graph(plan):
     return adj
 
 
+def build_signal_digraph(plan):
+    """有向信号流图：设备内部 in→out、生效常态 上→下、跳线 from→to。
+
+    与 solver.detect_loops 使用同一组有向边，用于追溯路由信号源：
+    源端口若能沿信号方向到达另一源端口，后者就不是独立信号源。
+    返回 succ: {port: {port, ...}}（含全部端口节点）。
+    """
+    solver = plan["solver"]
+    succ = defaultdict(set)
+    for name, d in plan["devices"].items():
+        for i in d["inputs"]:
+            for o in d["outputs"]:
+                succ[f"{name}.{i}"].add(f"{name}.{o}")
+    for p in plan["pairs"]:
+        if solver.normal_active(p) and p["top"] and p["bottom"]:
+            succ[f"{p['top']['device']}.{p['top']['port']}"].add(
+                f"{p['bottom']['device']}.{p['bottom']['port']}")
+    for c in solver.cables:
+        succ[c["fromPort"]].add(c["toPort"])
+    for port in solver.port_dir:
+        succ.setdefault(port, set())
+    return succ
+
+
 def _union_find(nodes):
     parent = {n: n for n in nodes}
 
@@ -483,9 +517,8 @@ def audit_signals(config, labels_raw):
                 routed_ports.add(payload)
     active_component = {find(p) for p in routed_ports}
 
-    # ---- 名签按端口聚合（区分静态标签与路由流动断言） --------------------
+    # ---- 名签按端口聚合（仅静态标签；路由行名签只参与别名图与计数） ----
     static_at = defaultdict(list)          # node -> [{canonical, raw, origin}]
-    route_at = defaultdict(list)
     static_labeled = set()                 # 任何静态名签（含纯别名）所在端口
     labeled_nodes = set()
     for d in decls:
@@ -493,9 +526,8 @@ def audit_signals(config, labels_raw):
         if d["origin"][0] != "route":
             if d["name"] or d["alias"]:
                 static_labeled.add(d["node"])
-        if d["name"]:
-            bucket = route_at if d["origin"][0] == "route" else static_at
-            bucket[d["node"]].append({
+        if d["name"] and d["origin"][0] != "route":
+            static_at[d["node"]].append({
                 "canonical": resolver.resolve(d["name"]),
                 "raw": d["name"], "origin": d["origin"],
                 "originAlias": d["originAlias"],
@@ -652,82 +684,128 @@ def audit_signals(config, labels_raw):
             }],
         })
 
-    # ---- 4) 跨路由串线：不同信号名的路由源汇于同一物理分量 --------------
-    def route_signal(idx, r):
-        """路由携带的代表规范名：路由名签优先，否则取源端口唯一静态名。"""
-        for d in route_at.get(f"{r['source']['device']}.{r['source']['port']}", ()):
-            return d["canonical"], d["origin"]
-        src = f"{r['source']['device']}.{r['source']['port']}"
-        stat = {nd["canonical"] for nd in static_at.get(src, ())}
-        if len(stat) == 1:
-            return next(iter(stat)), None
-        return None, None
+    # ---- 4) 跨路由串线：独立信号源的已规划路由汇于同一物理分量 ----------
+    # 判定与名签（规范名/别名）完全解耦，只追溯信号源与路由归属：
+    #  - 同一源端口的多条路由天然同源；
+    #  - 源端口在有向信号流图上同属一个强连通分量（如反馈环两端）合并为
+    #    一个独立源；
+    #  - 能被其他源沿信号方向到达的源（如调音台的混合输出）不是独立源，
+    #    其路由按可到达它的上游独立源归属；
+    #  - 同一无向物理分量内出现两个互不衍生的独立源 → 跨路由串线
+    #    （设备内部混合、半常态并送汇合均覆盖）。改名/改别名不会改变归属，
+    #    只有调整路由规划或物理连通才能消除，因此不提供任何 rename 修正。
+    dsucc = build_signal_digraph(plan)
+    planned_routes = [(info["index"], info["source"])
+                      for info in plan["planned"] if info["ok"]]
+    source_ports = {src for _, src in planned_routes}
 
-    route_sigs = []
-    for idx, r in enumerate(plan["routes"]):
-        if not plan["planned"][idx]["ok"]:
-            continue
-        canon, origin = route_signal(idx, r)
-        if canon:
-            src = f"{r['source']['device']}.{r['source']['port']}"
-            route_sigs.append((idx, canon, src, origin))
-    by_comp = defaultdict(list)
-    for idx, canon, src, origin in route_sigs:
-        by_comp[find(src)].append((idx, canon, src, origin))
-    for root, group in by_comp.items():
-        name_routes = defaultdict(list)         # canonical -> [(idx, src, origin)]
-        for idx, canon, src, origin in group:
-            name_routes[canon].append((idx, src, origin))
-        present = sorted(name_routes)
-        votes = {n: sum(1 for _ in entries)
-                 for n, entries in components[root]["names"].items() if entries}
-        for ai in range(len(present)):
-            for bi in range(ai + 1, len(present)):
-                ca, cb = present[ai], present[bi]
-                a_entries, b_entries = name_routes[ca], name_routes[cb]
-                nodes, _ = shortest_path(
-                    adj, [s for _, s, _ in a_entries], [s for _, s, _ in b_entries])
+    sccs = _tarjan_scc(dsucc.keys(), dsucc)
+    scc_of = {p: i for i, comp in enumerate(sccs) for p in comp}
+    comp_succ = [set() for _ in sccs]
+    for u, outs in dsucc.items():
+        for v in outs:
+            if scc_of[u] != scc_of[v]:
+                comp_succ[scc_of[u]].add(scc_of[v])
+    source_sccs = {scc_of[p] for p in source_ports}
+
+    def reachable_components(start):
+        """有向缩点图上从 start 可达的全部分量（可经非源分量中转）。"""
+        seen = {start}
+        q = deque([start])
+        while q:
+            u = q.popleft()
+            for v in comp_succ[u]:
+                if v not in seen:
+                    seen.add(v)
+                    q.append(v)
+        return seen
+
+    # 源 SCC → 沿信号方向可达（含自身）的全部源 SCC
+    reachable_sources = {s: (reachable_components(s) & source_sccs)
+                         for s in source_sccs}
+    # 独立源（根源 SCC）：没有任何其他源 SCC 能沿信号方向到达它
+    root_sccs = {s for s in source_sccs
+                 if not any(t != s and s in reachable_sources[t]
+                            for t in source_sccs)}
+    # 每个源 SCC 归属的独立源集合（自身为根时包含自身；混合点可归属多个）
+    owners_of = {s: {t for t in root_sccs if s in reachable_sources[t]}
+                 for s in source_sccs}
+
+    routes_from = defaultdict(list)          # 源端口 → 从该端口出发的路由
+    for idx, src in planned_routes:
+        routes_from[src].append(idx)
+
+    def group_payload(cid):
+        ports = sorted(p for p in source_ports if scc_of[p] == cid)
+        return {"port": ports[0], "ports": ports,
+                "routes": sorted(i for p in ports for i in routes_from[p])}
+
+    # 独立源按其源端口所在的无向物理分量归组（有向可达必在同一无向分量内）
+    roots_by_comp = defaultdict(set)
+    for cid in root_sccs:
+        roots_by_comp[find(group_payload(cid)["port"])].add(cid)
+
+    def desc_group(g):
+        rts = "、".join(str(i + 1) for i in g["routes"])
+        ports = "、".join(g["ports"])
+        return f"源端口 {ports} 的路由 {rts}" if rts else f"源端口 {ports}"
+
+    for uroot, gset in roots_by_comp.items():
+        groups = sorted((group_payload(cid) for cid in gset),
+                        key=lambda g: g["port"])
+        for ai in range(len(groups)):
+            for bi in range(ai + 1, len(groups)):
+                ga, gb = groups[ai], groups[bi]
+                # 证据：两组独立源端口之间的最短无向物理路径（改名不会改变）
+                nodes, _ = shortest_path(adj, ga["ports"], gb["ports"])
                 if nodes is None:
                     continue
-                preferred = min((ca, cb), key=lambda n: (-votes.get(n, 0), n))
-                loser = cb if preferred == ca else ca
-                r_a = [i for i, _, _ in a_entries]
-                r_b = [i for i, _, _ in b_entries]
-                fixes = _rename_fixes(components[root]["names"], preferred,
-                                      {loser}, rows)
-                seen_fix = {(f["target"]["kind"], f["target"].get("id"),
-                             f["target"].get("port"), f["target"].get("index"))
-                            for f in fixes}
-                # 落败信号名对应路由上的路由名签也要改（去重）
-                loser_routes = r_b if loser == cb else r_a
-                for ridx in loser_routes:
-                    origin = ("route", ridx)
-                    key = ("route", None, None, ridx)
-                    if key in seen_fix:
-                        continue
-                    raw = rows.get(origin, {}).get("name")
-                    if raw and resolver.resolve(raw) != preferred:
-                        fixes.append(_rename_fix(origin, raw, preferred, rows))
-                        seen_fix.add(key)
-                desc = lambda name, entries: (
-                    f"“{name}”（路由 {'、'.join(str(i + 1) for i, _, _ in entries)}，"
-                    f"源 {entries[0][1]}）")
+                # 下游混合点：非独立源 SCC 同时由这两个独立源衍生
+                # （典型：两路信号进同一台设备，其混合输出再带出一条路由）
+                downstream = []
+                for s in source_sccs - root_sccs:
+                    own = owners_of[s]
+                    if scc_of[ga["port"]] in own and scc_of[gb["port"]] in own:
+                        g = group_payload(s)
+                        if g["routes"]:
+                            downstream.append(g)
+                downstream.sort(key=lambda g: g["port"])
+                rts_all = sorted(set(ga["routes"] + gb["routes"]
+                                     + [i for g in downstream for i in g["routes"]]))
+                tail = ""
+                if downstream:
+                    tail = ("；下游混合点 " + "、".join(
+                        f"源端口 {g['ports'][0]}（路由 "
+                        f"{'、'.join(str(i + 1) for i in g['routes'])}）"
+                        for g in downstream)
+                        + " 的信号由上述独立源并流而成，这些路由同时归属两个独立源")
                 issues.append({
                     "type": CROSSTALK, "severity": "error",
                     "title": TYPE_TITLES[CROSSTALK],
-                    "message": f"携带 {desc(ca, a_entries)} 与 {desc(cb, b_entries)} "
-                               f"的路由在同一连通分量物理汇合，两条不同名信号发生"
-                               f"跨路由串线；若确认为同一信号，请统一规范名，否则应"
-                               f"断开它们之间的连通（审计不会自动改线）。",
-                    "component": root, "names": sorted((ca, cb)),
-                    "conflictingNames": [loser],
-                    "preferredName": preferred,
-                    "routes": sorted(r_a + r_b),
-                    "routesByName": {ca: r_a, cb: r_b},
-                    "suggestedName": preferred,
+                    "message": f"独立信号源「{desc_group(ga)}」与「{desc_group(gb)}」"
+                               f"的已规划路由在同一物理连通分量汇合，两个互不衍生的"
+                               f"独立信号在该分量内等电位（覆盖设备内部混合与半常态"
+                               f"并送汇合），发生跨路由串线。改名或改别名不会改变"
+                               f"信号源归属，无法消除本报警{tail}。只能调整路由规划"
+                               f"（取消或改道相关路由）或断开它们之间的物理连通"
+                               f"（拔除跳线 / 改变常态模式 / 修改背板接线）后重新规划。",
+                    "resolution": "调整路由规划或断开独立源之间的物理连通后重新规划；"
+                                  "重命名规范名 / 别名不能消除串线。",
+                    "component": uroot,
+                    # names 沿用数组结构供排序使用，内容为与标签无关的源端口
+                    "names": sorted(ga["ports"] + gb["ports"]),
+                    "sources": [{"port": ga["port"], "ports": ga["ports"],
+                                 "routes": ga["routes"]},
+                                {"port": gb["port"], "ports": gb["ports"],
+                                 "routes": gb["routes"]}],
+                    "routes": rts_all,
+                    "routesBySource": {ga["port"]: ga["routes"],
+                                       gb["port"]: gb["routes"]},
+                    "downstream": [{"port": g["ports"][0], "ports": g["ports"],
+                                    "routes": g["routes"]} for g in downstream],
                     "evidence": evidence_items(nodes, adj, plan,
                                                _node_label_map(decls)),
-                    "fixes": fixes,
+                    "fixes": [],
                 })
 
     # ---- 排序与编号 ------------------------------------------------------

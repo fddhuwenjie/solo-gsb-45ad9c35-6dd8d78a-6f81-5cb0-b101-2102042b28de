@@ -915,6 +915,10 @@ function renderAuditResult(data) {
       ? `❌ 发现 <b>${errN}</b> 个命名一致性错误`
       : "⚠️ 未发现硬冲突"}，另有 <b>${c.unlabeled}</b> 个无标签断点提醒。
       点击任一问题可在下方拓扑图上高亮其最短证据路径。审计不修改路由。</div>`;
+    if (c.crosstalk) {
+      html += `<div class="banner warn">⚠️ <b>${c.crosstalk}</b> 处跨路由串线只由路由规划与物理连通决定，
+        与规范名/别名无关：改名不能消警，需调整路由或断开独立源之间的连通后重新规划；复审时同一物理证据路径仍会高亮。</div>`;
+    }
   }
 
   html += `<div class="audit-stat-row">
@@ -965,6 +969,13 @@ function issueCardHtml(iss) {
     return `<li>${esc(fx.targetLabel)}：${change}
       <button onclick="applyAuditFix(${iss.id}, ${i}); event.stopPropagation()">采纳</button></li>`;
   }).join("");
+  // 跨路由串线不提供可消警的改名操作：只能调整路由规划或物理连通
+  const fixBlock = fixes
+    ? `<ul class="fix-list">${fixes}</ul>`
+    : (iss.type === "crosstalk"
+      ? `<div class="issue-sub">⚠ ${esc(iss.resolution ||
+          "跨路由串线不提供可消警的改名操作：只能调整路由规划或断开独立源之间的物理连通后重新规划。")}</div>`
+      : "");
   const tagLabel = iss.subtype === "cycle" ? "别名环"
     : iss.subtype === "diverging" ? "别名分叉" : ISSUE_TYPE_LABEL[iss.type];
   return `<div class="issue-card severity-${iss.severity}" id="issue-card-${iss.id}"
@@ -976,7 +987,7 @@ function issueCardHtml(iss) {
       ${iss.component != null ? `<span class="hint">连通分量 #${iss.component + 1}</span>` : ""}
     </div>
     <div class="issue-msg">${esc(iss.message)}</div>
-    ${fixes ? `<ul class="fix-list">${fixes}</ul>` : ""}
+    ${fixBlock}
     <span class="issue-evidence-toggle">▸ 最短证据路径（${evPorts.length} 个端点）</span>
     <div class="evidence-box" hidden>${chainHtml(iss.evidence)}</div>
   </div>`;
